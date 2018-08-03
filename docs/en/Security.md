@@ -15,11 +15,12 @@ This document describes the following security related features in Alluxio.
 Alluxio file system recognizes the user accessing the service.
 Having `SIMPLE` authentication is required to use other security features such as authorization.
 Alluxio also supports other authentication modes like `NOSASL` and `CUSTOM`.
-2. [Authorization](#authorization): If `alluxio.security.authorization.permission.enabled=true`
+1. [Authorization](#authorization): If `alluxio.security.authorization.permission.enabled=true`
 (by default), Alluxio file system will grant or deny user access based on the requesting user and
 the POSIX permission model of the files or directories to access.
 Note that, authentication cannot be `NOSASL` as authorization requires user information.
-3. [Auditing](#auditing): If `alluxio.master.audit.logging.enabled=true`, Alluxio file system
+1. [Impersonation](#impersonation): Alluxio supports user impersonation so one user can access Alluxio on the behalf of another user. This can be useful if an Alluxio client is part of a service which provides access to Alluxio for many different users.
+1. [Auditing](#auditing): If `alluxio.master.audit.logging.enabled=true`, Alluxio file system
 maintains an audit log for user accesses to file metadata.
 
 See [Security specific configuration](Configuration-Settings.html#security-configuration) for
@@ -115,7 +116,7 @@ The umask can be set by property `alluxio.security.authorization.permission.umas
 
 The owner, group, and permissions can be changed by two ways:
 
-1. User application invokes the setAttribute(...) method of `FileSystem API` or `Hadoop API`. See
+1. User application invokes the `setAttribute(...)` method of `FileSystem API` or `Hadoop API`. See
 [File System API](File-System-API.html).
 2. CLI command in shell. See
 [chown](Command-Line-Interface.html#chown),
@@ -163,9 +164,15 @@ must be set (replace `<USERNAME>` with `alluxio_user`). Both parameters are allo
 ### Client Configuration
 If the master enables impersonation for particular users, the client must also be configured to
 impersonate other users. This is configured with the parameter: `alluxio.security.login.impersonation.username` .
-This informs the Alluxio client to connect as usual, but impersonate as a different user. If the
-Hadoop compatible Alluxio client is used, a special value of `_HDFS_USER_` can be specified to informed
-the Alluxio client to impersonate the same user as the HDFS client.
+This informs the Alluxio client to connect as usual, but impersonate as a different user. The
+parameter can set to the following values:
+
+- empty
+  - Alluxio client impersonation is not used
+- `_NONE_`
+  - Alluxio client impersonation is not used
+- `_HDFS_USER_`
+  - the Alluxio client will impersonate as the same user as the HDFS client (when using the Hadoop compatible client.)
 
 ## Auditing
 Alluxio supports audit logging to allow system administrators to track users' access to file metadata.
