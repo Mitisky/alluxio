@@ -11,12 +11,11 @@
 
 package alluxio.security.authorization;
 
-import alluxio.proto.journal.File;
+import alluxio.proto.shared.Acl;
 
 import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableList;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -97,7 +96,7 @@ public class ExtendedACLEntries {
    *
    * @param entry the entry to be removed
    */
-  public void removeEntry(AclEntry entry) throws IOException {
+  public void removeEntry(AclEntry entry) {
     switch (entry.getType()) {
       case NAMED_USER:
         mNamedUserActions.remove(entry.getSubject());
@@ -107,8 +106,7 @@ public class ExtendedACLEntries {
         return;
       case MASK:
         if (hasExtended()) {
-          // cannot remove the mask if it is extended.
-          throw new IOException(
+          throw new IllegalStateException(
               "Deleting the mask for extended ACLs is not allowed. entry: " + entry);
         } else {
           mMaskActions = new AclActions();
@@ -179,10 +177,10 @@ public class ExtendedACLEntries {
   /**
    * @return a list of the proto representation of the named users actions
    */
-  public List<File.NamedAclActions> getNamedUsersProto() {
-    List<File.NamedAclActions> actions = new ArrayList<>(mNamedUserActions.size());
+  public List<Acl.NamedAclActions> getNamedUsersProto() {
+    List<Acl.NamedAclActions> actions = new ArrayList<>(mNamedUserActions.size());
     for (Map.Entry<String, AclActions> kv : mNamedUserActions.entrySet()) {
-      File.NamedAclActions namedActions = File.NamedAclActions.newBuilder()
+      Acl.NamedAclActions namedActions = Acl.NamedAclActions.newBuilder()
           .setName(kv.getKey())
           .setActions(AclActions.toProtoBuf(kv.getValue()))
           .build();
@@ -194,16 +192,48 @@ public class ExtendedACLEntries {
   /**
    * @return a list of the proto representation of the named group actions
    */
-  public List<File.NamedAclActions> getNamedGroupsProto() {
-    List<File.NamedAclActions> actions = new ArrayList<>(mNamedGroupActions.size());
+  public List<Acl.NamedAclActions> getNamedGroupsProto() {
+    List<Acl.NamedAclActions> actions = new ArrayList<>(mNamedGroupActions.size());
     for (Map.Entry<String, AclActions> kv : mNamedGroupActions.entrySet()) {
-      File.NamedAclActions namedActions = File.NamedAclActions.newBuilder()
+      Acl.NamedAclActions namedActions = Acl.NamedAclActions.newBuilder()
           .setName(kv.getKey())
           .setActions(AclActions.toProtoBuf(kv.getValue()))
           .build();
       actions.add(namedActions);
     }
     return actions;
+  }
+
+  /**
+   * Update the mask to be the union of owning group entry, named user entry and named group entry.
+   * @param groupActions the group entry to be integrated into the mask
+   */
+  public void updateMask(AclActions groupActions) {
+    AclActions result = new AclActions(groupActions);
+
+    for (Map.Entry<String, AclActions> kv : mNamedUserActions.entrySet()) {
+      AclActions userAction = kv.getValue();
+      result.merge(userAction);
+
+      for (AclAction action : AclAction.values()) {
+        if (result.contains(action) || userAction.contains(action)) {
+          result.add(action);
+        }
+      }
+    }
+
+    for (Map.Entry<String, AclActions> kv : mNamedGroupActions.entrySet()) {
+      AclActions userAction = kv.getValue();
+      result.merge(userAction);
+
+      for (AclAction action : AclAction.values()) {
+        if (result.contains(action) || userAction.contains(action)) {
+          result.add(action);
+        }
+      }
+    }
+
+    mMaskActions = result;
   }
 
   @Override

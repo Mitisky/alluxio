@@ -12,6 +12,7 @@
 package alluxio.client.block.stream;
 
 import alluxio.Configuration;
+import alluxio.Constants;
 import alluxio.PropertyKey;
 import alluxio.client.file.FileSystemContext;
 import alluxio.client.file.options.OutStreamOptions;
@@ -25,6 +26,7 @@ import alluxio.network.protocol.databuffer.DataNettyBufferV2;
 import alluxio.proto.dataserver.Protocol;
 import alluxio.proto.status.Status.PStatus;
 import alluxio.resource.LockResource;
+import alluxio.security.authorization.AccessControlList;
 import alluxio.util.CommonUtils;
 import alluxio.util.proto.ProtoMessage;
 import alluxio.wire.WorkerNetAddress;
@@ -75,6 +77,9 @@ public final class NettyPacketWriter implements PacketWriter {
       Configuration.getMs(PropertyKey.USER_NETWORK_NETTY_TIMEOUT_MS);
   private static final long CLOSE_TIMEOUT_MS =
       Configuration.getMs(PropertyKey.USER_NETWORK_NETTY_WRITER_CLOSE_TIMEOUT_MS);
+  /** Uses a long flush timeout since flush in S3 streaming upload may take a long time. */
+  private static final long FLUSH_TIMEOUT_MS =
+      Configuration.getMs(PropertyKey.USER_NETWORK_NETTY_WRITER_FLUSH_TIMEOUT);
 
   private final FileSystemContext mContext;
   private final Channel mChannel;
@@ -85,7 +90,15 @@ public final class NettyPacketWriter implements PacketWriter {
 
   private boolean mClosed;
 
+  /**
+   * Uses to gurantee the operation ordering.
+   *
+   * NOTE: {@link Channel#writeAndFlush(Object)} is async.
+   * Netty I/O thread executes the {@link ChannelFutureListener#operationComplete(Future)}
+   * before writing any new message to the wire, which may introduce another layer of ordering.
+   */
   private final ReentrantLock mLock = new ReentrantLock();
+
   /** The next pos to write to the channel. */
   @GuardedBy("mLock")
   private long mPosToWrite;
@@ -109,6 +122,8 @@ public final class NettyPacketWriter implements PacketWriter {
   private final Condition mBufferNotFullOrFailed = mLock.newCondition();
   /** This condition is met if there is nothing in the netty buffer. */
   private final Condition mBufferEmptyOrFailed = mLock.newCondition();
+  /** This condition is met if mPacketWriteException != null or flush is completed. */
+  private final Condition mFlushedOrFailed = mLock.newCondition();
 
   /**
    * @param context the file system context
@@ -153,8 +168,25 @@ public final class NettyPacketWriter implements PacketWriter {
       Protocol.CreateUfsFileOptions ufsFileOptions =
           Protocol.CreateUfsFileOptions.newBuilder().setUfsPath(options.getUfsPath())
               .setOwner(options.getOwner()).setGroup(options.getGroup())
-              .setMode(options.getMode().toShort()).setMountId(options.getMountId()).build();
+              .setMode(options.getMode().toShort()).setMountId(options.getMountId())
+              .setAcl(AccessControlList.toProtoBuf(options.getAcl()))
+              .build();
       builder.setCreateUfsFileOptions(ufsFileOptions);
+    }
+    // two cases to use UFS_FALLBACK_BLOCK endpoint:
+    // (1) this writer is created by the fallback of a short-circuit writer, or
+    boolean alreadyFallback = type == Protocol.RequestType.UFS_FALLBACK_BLOCK;
+    // (2) the write type is async when UFS tier is enabled.
+    boolean possibleToFallback = type == Protocol.RequestType.ALLUXIO_BLOCK
+        && options.getWriteType() == alluxio.client.WriteType.ASYNC_THROUGH
+        && Configuration.getBoolean(PropertyKey.USER_FILE_UFS_TIER_ENABLED);
+    if (alreadyFallback || possibleToFallback) {
+      // Overwrite to use the fallback-enabled endpoint in case (2)
+      builder.setType(Protocol.RequestType.UFS_FALLBACK_BLOCK);
+      Protocol.CreateUfsBlockOptions ufsBlockOptions =
+          Protocol.CreateUfsBlockOptions.newBuilder().setMountId(options.getMountId())
+          .setFallback(alreadyFallback).build();
+      builder.setCreateUfsBlockOptions(ufsBlockOptions);
     }
     mPartialRequest = builder.buildPartial();
     mPacketSize = packetSize;
@@ -209,6 +241,26 @@ public final class NettyPacketWriter implements PacketWriter {
         .addListener(new WriteListener(offset + len));
   }
 
+  /**
+   * Notifies the server UFS fallback endpoint to start writing a new block by resuming the given
+   * number of bytes from block store.
+   *
+   * @param pos number of bytes already written to block store
+   */
+  public void writeFallbackInitPacket(long pos) {
+    Preconditions.checkState(mPartialRequest.getType()
+        == Protocol.RequestType.UFS_FALLBACK_BLOCK);
+    Protocol.CreateUfsBlockOptions ufsBlockOptions = mPartialRequest.getCreateUfsBlockOptions()
+        .toBuilder().setBytesInBlockStore(pos).build();
+    Protocol.WriteRequest writeRequest = mPartialRequest.toBuilder().setOffset(0)
+        .setCreateUfsBlockOptions(ufsBlockOptions).build();
+    try (LockResource lr = new LockResource(mLock)) {
+      mPosToQueue = pos;
+    }
+    mChannel.writeAndFlush(new RPCProtoMessage(new ProtoMessage(writeRequest), null))
+        .addListener(new WriteListener(pos, true));
+  }
+
   @Override
   public void cancel() {
     if (mClosed) {
@@ -220,12 +272,11 @@ public final class NettyPacketWriter implements PacketWriter {
   @Override
   public void flush() throws IOException {
     mChannel.flush();
-
     try (LockResource lr = new LockResource(mLock)) {
-      while (true) {
-        if (mPosToWrite == mPosToQueue) {
-          return;
-        }
+      if (mEOFSent || mCancelSent || mPosToQueue == 0) {
+        return;
+      }
+      while (mPosToWrite != mPosToQueue) {
         if (mPacketWriteException != null) {
           Throwables.propagateIfPossible(mPacketWriteException, IOException.class);
           throw AlluxioStatusException.fromCheckedException(mPacketWriteException);
@@ -235,6 +286,18 @@ public final class NettyPacketWriter implements PacketWriter {
               String.format("Timeout flushing to %s for request %s after %dms.",
                   mAddress, mPartialRequest, WRITE_TIMEOUT_MS));
         }
+      }
+      if (mEOFSent || mCancelSent) {
+        return;
+      }
+      Protocol.WriteRequest writeRequest =
+          mPartialRequest.toBuilder().setOffset(mPosToQueue).setFlush(true).build();
+      mChannel.writeAndFlush(new RPCProtoMessage(new ProtoMessage(writeRequest), null))
+          .addListener(new FlushOrEofOrCancelListener());
+      if (!mFlushedOrFailed.await(FLUSH_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+        throw new DeadlineExceededException(
+            String.format("Timeout flush to %s for request %s after %dms.",
+                mAddress, mPartialRequest, FLUSH_TIMEOUT_MS));
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -325,7 +388,7 @@ public final class NettyPacketWriter implements PacketWriter {
     Protocol.WriteRequest writeRequest =
         mPartialRequest.toBuilder().setOffset(pos).setEof(true).build();
     mChannel.writeAndFlush(new RPCProtoMessage(new ProtoMessage(writeRequest), null))
-        .addListener(new EofOrCancelListener());
+        .addListener(new FlushOrEofOrCancelListener());
   }
 
   /**
@@ -344,7 +407,7 @@ public final class NettyPacketWriter implements PacketWriter {
     Protocol.WriteRequest writeRequest =
         mPartialRequest.toBuilder().setOffset(pos).setCancel(true).build();
     mChannel.writeAndFlush(new RPCProtoMessage(new ProtoMessage(writeRequest), null))
-        .addListener(new EofOrCancelListener());
+        .addListener(new FlushOrEofOrCancelListener());
   }
 
   @Override
@@ -378,16 +441,20 @@ public final class NettyPacketWriter implements PacketWriter {
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws IOException {
       Preconditions.checkState(acceptMessage(msg), "Incorrect response type %s.", msg);
-      RPCProtoMessage response = (RPCProtoMessage) msg;
+      RPCProtoMessage message = (RPCProtoMessage) msg;
+      Protocol.Response response = message.getMessage().asResponse();
       // Canceled is considered a valid status and handled in the writer. We avoid creating a
       // CanceledException as an optimization.
-      if (response.getMessage().asResponse().getStatus() != PStatus.CANCELED) {
-        CommonUtils.unwrapResponseFrom(response.getMessage().asResponse(), ctx.channel());
+      if (response.getStatus() != PStatus.CANCELED) {
+        CommonUtils.unwrapResponseFrom(response, ctx.channel());
       }
-
       try (LockResource lr = new LockResource(mLock)) {
-        mDone = true;
-        mDoneOrFailed.signal();
+        if (response.getMessage().equals(Constants.FLUSHED_SIGNAL)) {
+          mFlushedOrFailed.signal();
+        } else {
+          mDone = true;
+          mDoneOrFailed.signal();
+        }
       }
     }
 
@@ -400,6 +467,7 @@ public final class NettyPacketWriter implements PacketWriter {
         mBufferNotFullOrFailed.signal();
         mDoneOrFailed.signal();
         mBufferEmptyOrFailed.signal();
+        mFlushedOrFailed.signal();
       }
       ctx.close();
     }
@@ -415,6 +483,7 @@ public final class NettyPacketWriter implements PacketWriter {
           mBufferNotFullOrFailed.signal();
           mDoneOrFailed.signal();
           mBufferEmptyOrFailed.signal();
+          mFlushedOrFailed.signal();
         }
       }
       ctx.fireChannelUnregistered();
@@ -437,12 +506,19 @@ public final class NettyPacketWriter implements PacketWriter {
    */
   private final class WriteListener implements ChannelFutureListener {
     private final long mPosToWriteUncommitted;
+    private final boolean mIsUfsInit;
+
+    WriteListener(long posToWriteUncommitted, boolean isUfsInit) {
+      mPosToWriteUncommitted = posToWriteUncommitted;
+      mIsUfsInit = isUfsInit;
+    }
 
     /**
      * @param posToWriteUncommitted the pos to commit (i.e. update mPosToWrite)
      */
     WriteListener(long posToWriteUncommitted) {
       mPosToWriteUncommitted = posToWriteUncommitted;
+      mIsUfsInit = false;
     }
 
     @Override
@@ -450,10 +526,11 @@ public final class NettyPacketWriter implements PacketWriter {
       if (!future.isSuccess()) {
         future.channel().close();
       }
-      boolean shouldSendEOF = false;
       try (LockResource lr = new LockResource(mLock)) {
-        Preconditions.checkState(mPosToWriteUncommitted - mPosToWrite <= mPacketSize,
+        Preconditions.checkState(
+            mIsUfsInit || mPosToWriteUncommitted - mPosToWrite <= mPacketSize,
             "Some packet is not acked.");
+        Preconditions.checkState(mPosToWriteUncommitted <= mLength);
         Preconditions.checkState(mPosToWriteUncommitted <= mLength);
         mPosToWrite = mPosToWriteUncommitted;
 
@@ -462,6 +539,7 @@ public final class NettyPacketWriter implements PacketWriter {
           mDoneOrFailed.signal();
           mBufferNotFullOrFailed.signal();
           mBufferEmptyOrFailed.signal();
+          mFlushedOrFailed.signal();
           return;
         }
         if (mPosToWrite == mPosToQueue) {
@@ -471,23 +549,20 @@ public final class NettyPacketWriter implements PacketWriter {
           mBufferNotFullOrFailed.signal();
         }
         if (mPosToWrite == mLength) {
-          shouldSendEOF = true;
+          sendEof();
         }
-      }
-      if (shouldSendEOF) {
-        sendEof();
       }
     }
   }
 
   /**
-   * The netty channel future listener that is called when a EOF or CANCEL is complete.
+   * The netty channel future listener that is called when a FLUSH or EOF or CANCEL is complete.
    */
-  private final class EofOrCancelListener implements ChannelFutureListener {
+  private final class FlushOrEofOrCancelListener implements ChannelFutureListener {
     /**
      * Constructor.
      */
-    EofOrCancelListener() {}
+    FlushOrEofOrCancelListener() {}
 
     @Override
     public void operationComplete(ChannelFuture future) {
@@ -498,6 +573,7 @@ public final class NettyPacketWriter implements PacketWriter {
           mDoneOrFailed.signal();
           mBufferNotFullOrFailed.signal();
           mBufferEmptyOrFailed.signal();
+          mFlushedOrFailed.signal();
         }
       }
     }

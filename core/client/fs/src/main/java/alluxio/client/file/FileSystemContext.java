@@ -38,6 +38,7 @@ import alluxio.wire.WorkerInfo;
 import alluxio.wire.WorkerNetAddress;
 
 import com.codahale.metrics.Gauge;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Objects;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
@@ -49,7 +50,9 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -74,7 +77,9 @@ import javax.security.auth.Subject;
 public final class FileSystemContext implements Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(FileSystemContext.class);
 
-  private static FileSystemContext sInstance;
+  @GuardedBy("CONTEXT_CACHE_LOCK")
+  private static final Map<Subject, FileSystemContext> CONTEXT_CACHE = new HashMap<>();
+  private static final Object CONTEXT_CACHE_LOCK = new Object();
 
   static {
     MetricsSystem.startSinks();
@@ -93,6 +98,8 @@ public final class FileSystemContext implements Closeable {
   private ClientMasterSync mClientMasterSync;
 
   private final String mAppId;
+  @GuardedBy("CONTEXT_CACHE_LOCK")
+  private int mRefCount;
 
   // The netty data server channel pools.
   private final ConcurrentHashMap<ChannelPoolKey, NettyChannelPool>
@@ -118,45 +125,62 @@ public final class FileSystemContext implements Closeable {
   private final Subject mParentSubject;
 
   /**
-   * @return the instance of file system context
+   * @return the instance of file system context with no subject associated
    */
   public static FileSystemContext get() {
-    if (sInstance == null) {
-      synchronized (FileSystemContext.class) {
-        if (sInstance == null) {
-          sInstance = create();
-        }
-      }
-    }
-    return sInstance;
+    return get(null);
   }
 
   /**
-   * @return the context
+   * @param subject the subject associated with this context
+   * @return the instance of the file system context, possibly a shared context
    */
-  private static FileSystemContext create() {
-    return create(null);
+  public static FileSystemContext get(Subject subject) {
+    synchronized (CONTEXT_CACHE_LOCK) {
+      FileSystemContext ctx = CONTEXT_CACHE.computeIfAbsent(subject, FileSystemContext::create);
+      ctx.mRefCount++;
+      return ctx;
+    }
   }
 
   /**
    * @param subject the parent subject, set to null if not present
    * @return the context
    */
-  public static FileSystemContext create(Subject subject) {
-    return create(subject, MasterInquireClient.Factory.create());
+  private static FileSystemContext create(Subject subject) {
+    FileSystemContext context = new FileSystemContext(subject);
+    context.init(MasterInquireClient.Factory.create(), Configuration.global());
+    return context;
   }
 
   /**
+   * This method is provided for testing, use the {@link FileSystemContext#get} methods. The
+   * returned context object will not be cached automatically.
+   *
    * @param subject the parent subject, set to null if not present
    * @param masterInquireClient the client to use for determining the master; note that if the
    *        context is reset, this client will be replaced with a new masterInquireClient based on
    *        global configuration
    * @return the context
    */
+  @VisibleForTesting
   public static FileSystemContext create(Subject subject, MasterInquireClient masterInquireClient) {
     FileSystemContext context = new FileSystemContext(subject);
     context.init(masterInquireClient, Configuration.global());
+    synchronized (CONTEXT_CACHE_LOCK) { // Not necessary, for code consistency
+      context.mRefCount++;
+    }
     return context;
+  }
+
+  /**
+   * Clears the context cache. This method should only be called in test code.
+   */
+  @VisibleForTesting
+  public static void clearCache() {
+    synchronized (CONTEXT_CACHE_LOCK) {
+      CONTEXT_CACHE.clear();
+    }
   }
 
   /**
@@ -174,6 +198,7 @@ public final class FileSystemContext implements Closeable {
         + "from the client, such as metrics. It can be set manually through the {} property",
         mAppId, PropertyKey.Name.USER_APP_ID);
     mClosed = new AtomicBoolean(false);
+    mRefCount = 0;
   }
 
   /**
@@ -201,7 +226,17 @@ public final class FileSystemContext implements Closeable {
           .submit(new HeartbeatThread(HeartbeatContext.MASTER_METRICS_SYNC, mClientMasterSync,
               (int) configuration.getMs(PropertyKey.USER_METRICS_HEARTBEAT_INTERVAL_MS)));
       // register the shutdown hook
-      Runtime.getRuntime().addShutdownHook(new MetricsMasterSyncShutDownHook());
+      try {
+        Runtime.getRuntime().addShutdownHook(new MetricsMasterSyncShutDownHook());
+      } catch (IllegalStateException e) {
+        // this exception is thrown when the system is already in the process of shutting down. In
+        // such a situation, we are about to shutdown anyway and there is no need to register this
+        // shutdown hook
+      } catch (SecurityException e) {
+        LOG.info("Not registering metrics shutdown hook due to security exception. Regular "
+            + "heartbeats will still be performed to collect metrics data, but no final heartbeat "
+            + "will be performed on JVM exit. Security exception: {}", e.toString());
+      }
     }
   }
 
@@ -213,6 +248,22 @@ public final class FileSystemContext implements Closeable {
    */
   @Override
   public void close() throws IOException {
+    synchronized (CONTEXT_CACHE_LOCK) {
+      if (mRefCount == 0) {
+        LOG.warn("Attempted to close FileSystem Context that is already closed, have you called "
+            + "close multiple times?");
+        return;
+      }
+      if (--mRefCount != 0) {
+        return;
+      } else {
+        CONTEXT_CACHE.remove(mParentSubject);
+      }
+    }
+    closeInternal();
+  }
+
+  private void closeInternal() throws IOException {
     mFileSystemMasterClientPool.close();
     mFileSystemMasterClientPool = null;
     mBlockMasterClientPool.close();
@@ -226,7 +277,8 @@ public final class FileSystemContext implements Closeable {
 
     synchronized (this) {
       if (mMetricsMasterClient != null) {
-        ThreadUtils.shutdownAndAwaitTermination(mExecutorService);
+        ThreadUtils.shutdownAndAwaitTermination(mExecutorService,
+            Configuration.getMs(PropertyKey.METRICS_CONTEXT_SHUTDOWN_TIMEOUT));
         mMetricsMasterClient.close();
         mMetricsMasterClient = null;
         mClientMasterSync = null;
@@ -245,7 +297,7 @@ public final class FileSystemContext implements Closeable {
    *
    */
   public synchronized void reset(InstancedConfiguration configuration) throws IOException {
-    close();
+    closeInternal();
     init(MasterInquireClient.Factory.create(), configuration);
   }
 
@@ -433,18 +485,41 @@ public final class FileSystemContext implements Closeable {
   }
 
   /**
-   * Class that heartbeats to the metrics master before exit.
+   * Class that heartbeats to the metrics master before exit. The heartbeat is performed in a second
+   * thread so that we can exit early if the heartbeat is taking too long.
    */
   private final class MetricsMasterSyncShutDownHook extends Thread {
+    private final Thread mLastHeartbeatThread;
+
+    /**
+     * Creates a new metrics master shutdown hook.
+     */
+    public MetricsMasterSyncShutDownHook() {
+      mLastHeartbeatThread = new Thread(() -> {
+        if (mClientMasterSync != null) {
+          try {
+            mClientMasterSync.heartbeat();
+          } catch (InterruptedException e) {
+            return;
+          }
+        }
+      });
+      mLastHeartbeatThread.setDaemon(true);
+    }
+
     @Override
     public void run() {
+      mLastHeartbeatThread.start();
       try {
-        if (mClientMasterSync != null) {
-          mClientMasterSync.heartbeat();
-        }
+        // Shutdown hooks should run quickly, so we limit the wait time to 500ms. It isn't the end
+        // of the world if the final heartbeat fails.
+        mLastHeartbeatThread.join(500);
       } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        LOG.error("Failed to heartbeat to the metrics master before exit");
+        return;
+      } finally {
+        if (mLastHeartbeatThread.isAlive()) {
+          LOG.warn("Failed to heartbeat to the metrics master before exit");
+        }
       }
     }
   }
@@ -510,5 +585,4 @@ public final class FileSystemContext implements Closeable {
           .toString();
     }
   }
-
 }

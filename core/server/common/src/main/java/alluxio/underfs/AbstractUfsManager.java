@@ -20,7 +20,6 @@ import alluxio.util.IdUtils;
 
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Supplier;
 import com.google.common.io.Closer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,7 +46,7 @@ public abstract class AbstractUfsManager implements UfsManager {
 
     Key(AlluxioURI uri, Map<String, String> properties) {
       mScheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase();
-      mAuthority = uri.getAuthority() == null ? "" : uri.getAuthority().toLowerCase();
+      mAuthority = uri.getAuthority().toString().toLowerCase();
       mProperties = (properties == null || properties.isEmpty()) ? null : properties;
     }
 
@@ -113,7 +112,7 @@ public abstract class AbstractUfsManager implements UfsManager {
    * @return the UFS instance
    */
   private UnderFileSystem getOrAdd(AlluxioURI ufsUri, UnderFileSystemConfiguration ufsConf) {
-    Key key = new Key(ufsUri, ufsConf.getUserSpecifiedConf());
+    Key key = new Key(ufsUri, ufsConf.getMountSpecificConf());
     UnderFileSystem cachedFs = mUnderFileSystemMap.get(key);
     if (cachedFs != null) {
       return cachedFs;
@@ -137,12 +136,7 @@ public abstract class AbstractUfsManager implements UfsManager {
     Preconditions.checkArgument(mountId != IdUtils.INVALID_MOUNT_ID, "mountId");
     Preconditions.checkNotNull(ufsUri, "ufsUri");
     Preconditions.checkNotNull(ufsConf, "ufsConf");
-    mMountIdToUfsInfoMap.put(mountId, new UfsClient(new Supplier<UnderFileSystem>() {
-      @Override
-      public UnderFileSystem get() {
-        return getOrAdd(ufsUri, ufsConf);
-      }
-    }, ufsUri));
+    mMountIdToUfsInfoMap.put(mountId, new UfsClient(() -> getOrAdd(ufsUri, ufsConf), ufsUri));
   }
 
   @Override
@@ -175,7 +169,7 @@ public abstract class AbstractUfsManager implements UfsManager {
             Configuration.getNestedProperties(PropertyKey.MASTER_MOUNT_TABLE_ROOT_OPTION);
         addMount(IdUtils.ROOT_MOUNT_ID, new AlluxioURI(rootUri),
             UnderFileSystemConfiguration.defaults().setReadOnly(rootReadOnly).setShared(rootShared)
-                .setUserSpecifiedConf(rootConf));
+                .setMountSpecificConf(rootConf));
         try {
           mRootUfsClient = get(IdUtils.ROOT_MOUNT_ID);
         } catch (NotFoundException | UnavailableException e) {

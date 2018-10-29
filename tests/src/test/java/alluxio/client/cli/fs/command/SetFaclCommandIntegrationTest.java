@@ -36,6 +36,8 @@ public final class SetFaclCommandIntegrationTest extends AbstractFileSystemShell
       = Arrays.asList("user::rw-", "group::r--", "other::r--");
   private static final List<String> DIR_FACL_STRING_ENTRIES
       = Arrays.asList("user::rwx", "group::r-x", "other::r-x");
+  private static final List<String> FILE_FACL_STRING_ENTRIES
+      = Arrays.asList("user::rw-", "group::r-x", "other::r--");
   private static final List<String> DEFAULT_FACL_STRING_ENTRIES
       = Arrays.asList("default:user::rwx", "default:group::r-x", "default:other::r-x");
 
@@ -60,7 +62,7 @@ public final class SetFaclCommandIntegrationTest extends AbstractFileSystemShell
 
     List<String> stringEntries = new ArrayList<>(FACL_STRING_ENTRIES);
     stringEntries.add("user:testuser:rwx");
-    stringEntries.add("mask::---");
+    stringEntries.add("mask::rwx");
     expected += getFaclResultStr(testOwner, testOwner, "/testRoot/testFileA", stringEntries);
 
     Assert.assertEquals(expected, mOutput.toString());
@@ -95,7 +97,7 @@ public final class SetFaclCommandIntegrationTest extends AbstractFileSystemShell
     List<String> stringEntries = new ArrayList<>(DIR_FACL_STRING_ENTRIES);
     stringEntries.addAll(DEFAULT_FACL_STRING_ENTRIES);
     stringEntries.add("default:user:testuser:rwx");
-    stringEntries.add("default:mask::---");
+    stringEntries.add("default:mask::rwx");
     String expected = getFaclResultStr(testOwner, testOwner, "/testRoot/testDir", stringEntries);
 
     Assert.assertEquals(expected, mOutput.toString());
@@ -106,19 +108,19 @@ public final class SetFaclCommandIntegrationTest extends AbstractFileSystemShell
     mFsShell.run("getfacl", "/testRoot/testDir/testDir2");
     stringEntries = new ArrayList<>(DIR_FACL_STRING_ENTRIES);
     stringEntries.add("user:testuser:rwx");
-    stringEntries.add("mask::---");
+    stringEntries.add("mask::r-x");
     stringEntries.addAll(DEFAULT_FACL_STRING_ENTRIES);
     stringEntries.add("default:user:testuser:rwx");
-    stringEntries.add("default:mask::---");
+    stringEntries.add("default:mask::rwx");
     expected += getFaclResultStr(testOwner, testOwner,
         "/testRoot/testDir/testDir2", stringEntries);
 
     Assert.assertEquals(expected, mOutput.toString());
 
     mFsShell.run("getfacl", "/testRoot/testDir/testDir2/testFileD");
-    stringEntries = new ArrayList<>(DIR_FACL_STRING_ENTRIES);
+    stringEntries = new ArrayList<>(FILE_FACL_STRING_ENTRIES);
     stringEntries.add("user:testuser:rwx");
-    stringEntries.add("mask::---");
+    stringEntries.add("mask::r--");
     expected += getFaclResultStr(testOwner, testOwner,
         "/testRoot/testDir/testDir2/testFileD", stringEntries);
     Assert.assertEquals(expected, mOutput.toString());
@@ -157,5 +159,4 @@ public final class SetFaclCommandIntegrationTest extends AbstractFileSystemShell
     files[3] = mFileSystem.getStatus(new AlluxioURI("/testRoot/testFileC"));
     return files;
   }
-
 }

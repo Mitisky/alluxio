@@ -12,10 +12,12 @@
 package alluxio.worker.netty;
 
 import alluxio.Configuration;
+import alluxio.Constants;
 import alluxio.PropertyKey;
 import alluxio.exception.status.AlluxioStatusException;
 import alluxio.exception.status.InternalException;
 import alluxio.exception.status.InvalidArgumentException;
+import alluxio.exception.status.Status;
 import alluxio.network.protocol.RPCMessage;
 import alluxio.network.protocol.RPCProtoMessage;
 import alluxio.network.protocol.databuffer.DataBuffer;
@@ -85,10 +87,15 @@ abstract class AbstractWriteHandler<T extends WriteRequestContext<?>>
    * EOF: the end of file.
    * CANCEL: the write request is cancelled by the client.
    * ABORT: a non-recoverable error is detected, abort this channel.
+   * FLUSH: flush the buffered data.
    */
   private static final ByteBuf EOF = Unpooled.buffer(0);
   private static final ByteBuf CANCEL = Unpooled.buffer(0);
   private static final ByteBuf ABORT = Unpooled.buffer(0);
+  private static final ByteBuf FLUSH = Unpooled.buffer(0);
+  protected static final ByteBuf UFS_FALLBACK_INIT = Unpooled.buffer(0);
+  @GuardedBy("mLock")
+  protected long mUfsFallbackInitBytes = 0;
 
   private ReentrantLock mLock = new ReentrantLock();
 
@@ -169,6 +176,16 @@ abstract class AbstractWriteHandler<T extends WriteRequestContext<?>>
         buf = EOF;
       } else if (writeRequest.getCancel()) {
         buf = CANCEL;
+      } else if (writeRequest.getFlush()) {
+        buf = FLUSH;
+      } else if (writeRequest.hasCreateUfsBlockOptions()
+          && writeRequest.getOffset() == 0
+          && writeRequest.getCreateUfsBlockOptions().hasBytesInBlockStore()) {
+        // This is the init packet sent from a client falling back from a failed short-circuit block
+        // write.
+        buf = UFS_FALLBACK_INIT;
+        mUfsFallbackInitBytes = writeRequest.getCreateUfsBlockOptions().getBytesInBlockStore();
+        mContext.setPosToQueue(mContext.getPosToQueue() + mUfsFallbackInitBytes);
       } else {
         DataBuffer dataBuffer = msg.getPayloadDataBuffer();
         Preconditions.checkState(dataBuffer != null && dataBuffer.getLength() > 0);
@@ -287,8 +304,24 @@ abstract class AbstractWriteHandler<T extends WriteRequestContext<?>>
           }
         }
 
+        if (buf == FLUSH) {
+          try {
+            flushRequest(mContext);
+            replyFlush();
+            continue;
+          } catch (Exception e) {
+            LOG.error("Failed to flush for write request {}", mContext.getRequest(), e);
+            Throwables.propagateIfPossible(e);
+            pushAbortPacket(mChannel,
+                new Error(AlluxioStatusException.fromCheckedException(e), true));
+          }
+        }
         try {
           int readableBytes = buf.readableBytes();
+          if (buf == UFS_FALLBACK_INIT) {
+            buf.retain(); // prevent the release in final destruct UFS_FALLBACK_INIT
+            readableBytes = (int) mUfsFallbackInitBytes;
+          }
           mContext.setPosToWrite(mContext.getPosToWrite() + readableBytes);
           writeBuf(mContext, mChannel, buf, mContext.getPosToWrite());
           incrementMetrics(readableBytes);
@@ -350,6 +383,13 @@ abstract class AbstractWriteHandler<T extends WriteRequestContext<?>>
     protected abstract void cleanupRequest(T context) throws Exception;
 
     /**
+     * Flushes the buffered data. Flush only happens after write.
+     *
+     * @param context context of the request to complete
+     */
+    protected abstract void flushRequest(T context) throws Exception;
+
+    /**
      * Writes the buffer.
      *
      * @param context context of the request to complete
@@ -394,6 +434,15 @@ abstract class AbstractWriteHandler<T extends WriteRequestContext<?>>
             .addListener(ChannelFutureListener.CLOSE);
       }
     }
+
+    /**
+     * Writes a response to signify the successful flush.
+     */
+    private void replyFlush() {
+      mChannel.writeAndFlush(RPCProtoMessage
+          .createResponse(Status.OK, Constants.FLUSHED_SIGNAL, null))
+          .addListeners(ChannelFutureListener.CLOSE_ON_FAILURE);
+    }
   }
 
   /**
@@ -424,7 +473,7 @@ abstract class AbstractWriteHandler<T extends WriteRequestContext<?>>
    * @param buf the netty byte buffer
    */
   private static void release(ByteBuf buf) {
-    if (buf != null && buf != EOF && buf != CANCEL && buf != ABORT) {
+    if (buf != null && buf != EOF && buf != CANCEL && buf != ABORT && buf != FLUSH) {
       buf.release();
     }
   }

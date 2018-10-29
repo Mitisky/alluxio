@@ -11,7 +11,7 @@
 
 package alluxio.security.authorization;
 
-import alluxio.proto.journal.File;
+import alluxio.proto.shared.Acl;
 import alluxio.thrift.TAcl;
 import alluxio.thrift.TAclEntry;
 
@@ -169,7 +169,7 @@ public class AccessControlList implements Serializable {
    *
    * @param entry the entry to be removed
    */
-  public void removeEntry(AclEntry entry) throws IOException {
+  public void removeEntry(AclEntry entry) {
     switch (entry.getType()) {
       case NAMED_USER:  // fall through
       case NAMED_GROUP: // fall through
@@ -227,14 +227,25 @@ public class AccessControlList implements Serializable {
   }
 
   /**
+   * Update the mask to be the union of owning group entry, named user entry and named group entry.
+   * This method must be called when the aforementioned entries are modified.
+   */
+  public void updateMask() {
+    if (hasExtended()) {
+      AclActions actions = getOwningGroupActions();
+      mExtendedEntries.updateMask(actions);
+    }
+  }
+
+  /**
    * Sets an entry into the access control list.
    * If an entry with the same type and subject already exists, overwrites the existing entry;
    * Otherwise, adds this new entry.
+   * After we modify entries for NAMED_GROUP, OWNING_GROUP, NAMED_USER, we need to update the mask.
    *
    * @param entry the entry to be added or updated
    */
   public void setEntry(AclEntry entry) {
-    // TODO(cc): when setting non-mask entries, the mask should be dynamically updated too.
     switch (entry.getType()) {
       case NAMED_USER:  // fall through
       case NAMED_GROUP: // fall through
@@ -296,11 +307,11 @@ public class AccessControlList implements Serializable {
    * for other actions, checkPermission(user, groups, action) is false.
    *
    * 1. If the user is the owner, then return the permission in the owner entry;
-   * 2. Else if the user matches the name of one of the named user entries, then return the
-   *    permission in this entry;
+   * 2. Else if the user matches the name of one of the named user entries, then return the AND
+   *    result of the permission in this entry and the mask ;
    * 3. Else if at least one of the groups is the owning group or matches the name of one of the
    *    named group entries, then for the named group entries that match a member of groups, merge
-   *    the permissions in these entries and return the merged permission;
+   *    the permissions in these entries and return the merged permission ANDed with the mask;
    * 4. Otherwise, return the permission in the other entry.
    *
    * @param user the user
@@ -314,7 +325,9 @@ public class AccessControlList implements Serializable {
     if (hasExtended()) {
       AclActions actions = mExtendedEntries.getNamedUser(user);
       if (actions != null) {
-        return new AclActions(actions);
+        AclActions result = new AclActions(actions);
+        result.mask(mExtendedEntries.mMaskActions);
+        return result;
       }
     }
 
@@ -334,6 +347,9 @@ public class AccessControlList implements Serializable {
       }
     }
     if (isGroupKnown) {
+      if (hasExtended()) {
+        groupActions.mask(mExtendedEntries.mMaskActions);
+      }
       return groupActions;
     }
 
@@ -376,7 +392,7 @@ public class AccessControlList implements Serializable {
    * @param acl the protobuf representation
    * @return {@link AccessControlList}
    */
-  public static AccessControlList fromProtoBuf(File.AccessControlList acl) {
+  public static AccessControlList fromProtoBuf(Acl.AccessControlList acl) {
     AccessControlList ret;
     if (acl.hasIsDefault() && acl.getIsDefault()) {
       ret = new DefaultAccessControlList();
@@ -393,7 +409,7 @@ public class AccessControlList implements Serializable {
     // true if there are any extended entries (named user or named group)
     boolean hasExtended = false;
 
-    for (File.NamedAclActions namedActions : acl.getUserActionsList()) {
+    for (Acl.NamedAclActions namedActions : acl.getUserActionsList()) {
       String name = namedActions.getName();
       AclActions actions = AclActions.fromProtoBuf(namedActions.getActions());
       AclEntry entry;
@@ -408,7 +424,7 @@ public class AccessControlList implements Serializable {
       ret.setEntry(entry);
     }
 
-    for (File.NamedAclActions namedActions : acl.getGroupActionsList()) {
+    for (Acl.NamedAclActions namedActions : acl.getGroupActionsList()) {
       String name = namedActions.getName();
       AclActions actions = AclActions.fromProtoBuf(namedActions.getActions());
       AclEntry entry;
@@ -443,17 +459,17 @@ public class AccessControlList implements Serializable {
    * @param acl {@link AccessControlList}
    * @return protobuf representation
    */
-  public static File.AccessControlList toProtoBuf(AccessControlList acl) {
-    File.AccessControlList.Builder builder = File.AccessControlList.newBuilder();
+  public static Acl.AccessControlList toProtoBuf(AccessControlList acl) {
+    Acl.AccessControlList.Builder builder = Acl.AccessControlList.newBuilder();
     builder.setOwningUser(acl.mOwningUser);
     builder.setOwningGroup(acl.mOwningGroup);
 
     // base entries
-    builder.addUserActions(File.NamedAclActions.newBuilder()
+    builder.addUserActions(Acl.NamedAclActions.newBuilder()
         .setName(OWNING_USER_KEY)
         .setActions(AclActions.toProtoBuf(acl.getOwningUserActions()))
         .build());
-    builder.addGroupActions(File.NamedAclActions.newBuilder()
+    builder.addGroupActions(Acl.NamedAclActions.newBuilder()
         .setName(OWNING_GROUP_KEY)
         .setActions(AclActions.toProtoBuf(acl.getOwningGroupActions()))
         .build());

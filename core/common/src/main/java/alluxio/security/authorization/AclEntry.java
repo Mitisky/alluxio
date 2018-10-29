@@ -11,7 +11,7 @@
 
 package alluxio.security.authorization;
 
-import alluxio.proto.journal.File;
+import alluxio.proto.shared.Acl;
 import alluxio.thrift.TAclAction;
 import alluxio.thrift.TAclEntry;
 
@@ -183,7 +183,8 @@ public final class AclEntry implements Serializable {
     }
     List<String> components = Arrays.stream(stringEntry.split(":")).map(String::trim).collect(
         Collectors.toList());
-    if (!(components.size() == 3 || (components.size() == 4
+    if (!((components.size() == 3 && !components.get(0).equals(DEFAULT_KEYWORD))
+        || (components.size() == 4
         && components.get(0).equals(DEFAULT_KEYWORD)))) {
       throw new IllegalArgumentException("Unexpected acl components: " + stringEntry);
     }
@@ -339,13 +340,13 @@ public final class AclEntry implements Serializable {
    * @param pEntry the proto representation
    * @return the {@link AclEntry} instance created from the proto representation
    */
-  public static AclEntry fromProto(File.AclEntry pEntry) {
+  public static AclEntry fromProto(Acl.AclEntry pEntry) {
     AclEntry.Builder builder = new AclEntry.Builder();
     builder.setType(AclEntryType.fromProto(pEntry.getType()));
     builder.setSubject(pEntry.getSubject());
     builder.setIsDefault(pEntry.getIsDefault());
 
-    for (File.AclAction pAction : pEntry.getActionsList()) {
+    for (Acl.AclAction pAction : pEntry.getActionsList()) {
       builder.addAction(AclAction.fromProtoBuf(pAction));
     }
     return builder.build();
@@ -354,8 +355,8 @@ public final class AclEntry implements Serializable {
   /**
    * @return the proto representation of this instance
    */
-  public File.AclEntry toProto() {
-    File.AclEntry.Builder builder = File.AclEntry.newBuilder();
+  public Acl.AclEntry toProto() {
+    Acl.AclEntry.Builder builder = Acl.AclEntry.newBuilder();
     builder.setType(mType.toProto());
     builder.setSubject(mSubject);
     builder.setIsDefault(mIsDefault);

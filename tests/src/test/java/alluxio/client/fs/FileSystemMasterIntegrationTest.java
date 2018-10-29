@@ -283,9 +283,6 @@ public class FileSystemMasterIntegrationTest extends BaseIntegrationTest {
         mFsMaster.listStatus(ROOT_PATH2, ListStatusOptions.defaults()).size());
   }
 
-  /**
-   * Tests that creating a file which already exists.
-   */
   @Test
   public void createAlreadyExistFile() throws Exception {
     mThrown.expect(FileAlreadyExistsException.class);
@@ -293,9 +290,6 @@ public class FileSystemMasterIntegrationTest extends BaseIntegrationTest {
     mFsMaster.createDirectory(new AlluxioURI("/testFile"), CreateDirectoryOptions.defaults());
   }
 
-  /**
-   * Tests that creating a directory.
-   */
   @Test
   public void createDirectory() throws Exception {
     mFsMaster.createDirectory(new AlluxioURI("/testFolder"), CreateDirectoryOptions.defaults());
@@ -1018,18 +1012,6 @@ public class FileSystemMasterIntegrationTest extends BaseIntegrationTest {
     mThrown.expect(AccessControlException.class);
     mFsMaster.createDirectory(new AlluxioURI("/in_ufs"),
         CreateDirectoryOptions.defaults().setPersisted(true));
-  }
-
-  @Test
-  public void ufsModePersist() throws Exception {
-    mFsMaster.updateUfsMode(new AlluxioURI(mFsMaster.getUfsAddress()),
-        UnderFileSystem.UfsMode.READ_ONLY);
-
-    AlluxioURI alluxioFile = new AlluxioURI("/in_alluxio");
-    mFsMaster.createFile(alluxioFile, CreateFileOptions.defaults().setPersisted(false));
-
-    mThrown.expect(AccessControlException.class);
-    mFsMaster.scheduleAsyncPersistence(alluxioFile);
   }
 
   @Test

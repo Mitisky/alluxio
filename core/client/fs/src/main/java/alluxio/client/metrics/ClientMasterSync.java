@@ -62,8 +62,8 @@ public final class ClientMasterSync implements HeartbeatExecutor {
     try {
       mMasterClient.heartbeat(metrics);
     } catch (IOException e) {
-      // An error occurred, log and ignore it or error if heartbeat timeout is reached
-      LOG.error("Failed to heartbeat to the metrics master: {}", e);
+      // An error occurred, log and ignore it or error if heartbeat timeout is reached.
+      LOG.error("Failed to heartbeat to the metrics master:", e);
       mMasterClient.disconnect();
     }
   }

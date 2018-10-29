@@ -13,6 +13,7 @@ package alluxio.underfs;
 
 import alluxio.AlluxioURI;
 import alluxio.Constants;
+import alluxio.collections.Pair;
 import alluxio.exception.status.UnimplementedException;
 import alluxio.security.authorization.AccessControlList;
 import alluxio.metrics.CommonMetrics;
@@ -20,6 +21,8 @@ import alluxio.metrics.Metric;
 import alluxio.metrics.MetricsSystem;
 import alluxio.metrics.WorkerMetrics;
 import alluxio.security.authentication.AuthenticatedClientUser;
+import alluxio.security.authorization.AclEntry;
+import alluxio.security.authorization.DefaultAccessControlList;
 import alluxio.underfs.options.CreateOptions;
 import alluxio.underfs.options.DeleteOptions;
 import alluxio.underfs.options.FileLocationOptions;
@@ -65,6 +68,22 @@ public class UnderFileSystemWithLogging implements UnderFileSystem {
     Preconditions.checkNotNull(path, "path");
     mPath = path;
     mUnderFileSystem = ufs;
+  }
+
+  @Override
+  public void cleanup() throws IOException {
+    call(new UfsCallable<Void>() {
+      @Override
+      public Void call() throws IOException {
+        mUnderFileSystem.cleanup();
+        return null;
+      }
+
+      @Override
+      public String toString() {
+        return "Cleanup";
+      }
+    });
   }
 
   @Override
@@ -207,11 +226,12 @@ public class UnderFileSystemWithLogging implements UnderFileSystem {
   }
 
   @Override
-  public AccessControlList getAcl(String path) throws IOException, UnimplementedException {
-    return call(new UfsCallable<AccessControlList>() {
+  public Pair<AccessControlList, DefaultAccessControlList> getAclPair(String path)
+      throws IOException, UnimplementedException {
+    return call(new UfsCallable<Pair<AccessControlList, DefaultAccessControlList>>() {
       @Override
-      public AccessControlList call() throws IOException {
-        return mUnderFileSystem.getAcl(path);
+      public Pair<AccessControlList, DefaultAccessControlList> call() throws IOException {
+        return mUnderFileSystem.getAclPair(path);
       }
 
       @Override
@@ -402,7 +422,7 @@ public class UnderFileSystemWithLogging implements UnderFileSystem {
     return call(new UfsCallable<UfsStatus[]>() {
       @Override
       public UfsStatus[] call() throws IOException {
-        return mUnderFileSystem.listStatus(path);
+        return filterInvalidPaths(mUnderFileSystem.listStatus(path), path);
       }
 
       @Override
@@ -418,7 +438,7 @@ public class UnderFileSystemWithLogging implements UnderFileSystem {
     return call(new UfsCallable<UfsStatus[]>() {
       @Override
       public UfsStatus[] call() throws IOException {
-        return mUnderFileSystem.listStatus(path, options);
+        return filterInvalidPaths(mUnderFileSystem.listStatus(path, options), path);
       }
 
       @Override
@@ -426,6 +446,33 @@ public class UnderFileSystemWithLogging implements UnderFileSystem {
         return String.format("ListStatus: path=%s, options=%s", path, options);
       }
     });
+  }
+
+  private UfsStatus[] filterInvalidPaths(UfsStatus[] statuses, String listedPath) {
+    // This is a temporary fix to prevent us from choking on paths containing '?'.
+    if (statuses == null) {
+      return null;
+    }
+    int removed = 0;
+    for (UfsStatus status : statuses) {
+      if (status.getName().contains("?")) {
+        LOG.warn("Ignoring {} while listing {} since it contains '?'", status.getName(),
+            listedPath);
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      UfsStatus[] newStatuses = new UfsStatus[statuses.length - removed];
+      int i = 0;
+      // We perform two passes to keep the common case (no invalid names) very cheap.
+      for (UfsStatus status : statuses) {
+        if (!status.getName().contains("?")) {
+          newStatuses[i++] = status;
+        }
+      }
+      return newStatuses;
+    }
+    return statuses;
   }
 
   @Override
@@ -524,17 +571,17 @@ public class UnderFileSystemWithLogging implements UnderFileSystem {
   }
 
   @Override
-  public void setAcl(String path, AccessControlList acl) throws IOException {
+  public void setAclEntries(String path, List<AclEntry> aclEntries) throws IOException {
     call(new UfsCallable<Void>() {
       @Override
       public Void call() throws IOException {
-        mUnderFileSystem.setAcl(path, acl);
+        mUnderFileSystem.setAclEntries(path, aclEntries);
         return null;
       }
 
       @Override
       public String toString() {
-        return String.format("SetAcl: path=%s, ACL=%s", path, acl);
+        return String.format("SetAcl: path=%s, ACLEntries=%s", path, aclEntries);
       }
     });
   }

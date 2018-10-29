@@ -26,12 +26,13 @@ import alluxio.master.MasterRegistry;
 import alluxio.master.MasterTestUtils;
 import alluxio.master.block.BlockMaster;
 import alluxio.master.block.BlockMasterFactory;
-import alluxio.master.file.meta.Inode;
 import alluxio.master.file.meta.InodeDirectoryIdGenerator;
 import alluxio.master.file.meta.InodeFile;
 import alluxio.master.file.meta.InodeTree;
+import alluxio.master.file.meta.InodeView;
 import alluxio.master.file.meta.LockedInodePath;
 import alluxio.master.file.meta.MountTable;
+import alluxio.master.file.meta.options.MountInfo;
 import alluxio.master.file.options.CreateFileOptions;
 import alluxio.master.journal.NoopJournalContext;
 import alluxio.master.metrics.MetricsMaster;
@@ -181,7 +182,7 @@ public final class PermissionCheckerTest {
     BlockMaster blockMaster = new BlockMasterFactory().create(sRegistry, masterContext);
     InodeDirectoryIdGenerator directoryIdGenerator = new InodeDirectoryIdGenerator(blockMaster);
     UfsManager ufsManager = mock(UfsManager.class);
-    MountTable mountTable = new MountTable(ufsManager);
+    MountTable mountTable = new MountTable(ufsManager, mock(MountInfo.class));
     sTree = new InodeTree(blockMaster, directoryIdGenerator, mountTable);
 
     sRegistry.start(true);
@@ -237,7 +238,7 @@ public final class PermissionCheckerTest {
    * @param expectedInodes the expected inodes names
    * @param inodes the inodes for test
    */
-  private static void verifyInodesList(String[] expectedInodes, List<Inode<?>> inodes) {
+  private static void verifyInodesList(String[] expectedInodes, List<InodeView> inodes) {
     String[] inodesName = new String[inodes.size()];
     for (int i = 0; i < inodes.size(); i++) {
       inodesName[i] = inodes.get(i).getName();

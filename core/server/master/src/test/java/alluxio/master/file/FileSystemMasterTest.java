@@ -11,10 +11,13 @@
 
 package alluxio.master.file;
 
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.hasItem;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -242,6 +245,14 @@ public final class FileSystemMasterTest {
 
     mThrown.expect(FileAlreadyExistsException.class);
     mFileSystemMaster.createFile(path, CreateFileOptions.defaults().setPersisted(true));
+  }
+
+  @Test
+  public void createFileUsesOperationTime() throws Exception {
+    AlluxioURI path = new AlluxioURI("/test");
+    mFileSystemMaster.createFile(path, CreateFileOptions.defaults().setOperationTimeMs(100));
+    assertEquals(100, mFileSystemMaster.getFileInfo(path, GetStatusOptions.defaults())
+        .getLastModificationTimeMs());
   }
 
   /**
@@ -1086,7 +1097,6 @@ public final class FileSystemMasterTest {
     infos = mFileSystemMaster.listStatus(ROOT_URI, ListStatusOptions.defaults()
         .setLoadMetadataType(LoadMetadataType.Always).setRecursive(true));
     assertEquals(files + files +  2 + 2 + 2 , infos.size());
-
   }
 
   @Test
@@ -1226,6 +1236,7 @@ public final class FileSystemMasterTest {
         .getFileInfo(NESTED_URI, GET_STATUS_OPTIONS).convertDefaultAclToStringEntries());
     assertTrue(entries.containsAll(oldEntries));
     assertTrue(entries.containsAll(newEntries));
+    assertTrue(entries.contains("default:mask::rwx"));
 
     // modify existing and add
     newEntries = Sets.newHashSet("default:user:usera:---", "default:group:groupa:--x",
@@ -1300,7 +1311,7 @@ public final class FileSystemMasterTest {
     assertEquals(newEntries, entries);
 
     // modify existing
-    newEntries = Sets.newHashSet("user::rwx", "group::rw-", "other::r-x");
+    newEntries = Sets.newHashSet("user::rwx", "group::r--", "other::r-x");
     mFileSystemMaster.setAcl(NESTED_FILE_URI, SetAclAction.MODIFY,
         newEntries.stream().map(AclEntry::fromCliString).collect(Collectors.toList()), options);
 
@@ -1318,6 +1329,8 @@ public final class FileSystemMasterTest {
         .getFileInfo(NESTED_FILE_URI, GET_STATUS_OPTIONS).convertAclToStringEntries());
     assertTrue(entries.containsAll(oldEntries));
     assertTrue(entries.containsAll(newEntries));
+    // check if the mask got updated correctly
+    assertTrue(entries.contains("mask::r-x"));
 
     // modify existing and add
     newEntries = Sets.newHashSet("user:usera:---", "group:groupa:--x", "other::r-x");
@@ -1391,6 +1404,72 @@ public final class FileSystemMasterTest {
     for (FileInfo info : infos) {
       assertEquals(newEntries, Sets.newHashSet(info.convertAclToStringEntries()));
     }
+  }
+
+  @Test
+  public void removeExtendedAclMask() throws Exception {
+    mFileSystemMaster.createDirectory(NESTED_URI,
+        CreateDirectoryOptions.defaults().setRecursive(true));
+    AclEntry newAcl = AclEntry.fromCliString("user:newuser:rwx");
+    // Add an ACL
+    addAcl(NESTED_URI, newAcl);
+    assertThat(getInfo(NESTED_URI).getAcl().getEntries(), hasItem(newAcl));
+
+    // Attempt to remove the ACL mask
+    AclEntry maskEntry = AclEntry.fromCliString("mask::rwx");
+    assertThat(getInfo(NESTED_URI).getAcl().getEntries(), hasItem(maskEntry));
+    try {
+      removeAcl(NESTED_URI, maskEntry);
+      fail("Expected removing the mask from an extended ACL to fail");
+    } catch (IOException e) {
+      assertThat(e.getMessage(), containsString("mask"));
+    }
+
+    // Remove the extended ACL
+    removeAcl(NESTED_URI, newAcl);
+    // Now we can add and remove a mask
+    addAcl(NESTED_URI, maskEntry);
+    removeAcl(NESTED_URI, maskEntry);
+  }
+
+  @Test
+  public void removeExtendedDefaultAclMask() throws Exception {
+    mFileSystemMaster.createDirectory(NESTED_URI,
+        CreateDirectoryOptions.defaults().setRecursive(true));
+    AclEntry newAcl = AclEntry.fromCliString("default:user:newuser:rwx");
+    // Add an ACL
+    addAcl(NESTED_URI, newAcl);
+    assertThat(getInfo(NESTED_URI).getDefaultAcl().getEntries(), hasItem(newAcl));
+
+    // Attempt to remove the ACL mask
+    AclEntry maskEntry = AclEntry.fromCliString("default:mask::rwx");
+    assertThat(getInfo(NESTED_URI).getDefaultAcl().getEntries(), hasItem(maskEntry));
+    try {
+      removeAcl(NESTED_URI, maskEntry);
+      fail("Expected removing the mask from an extended ACL to fail");
+    } catch (IOException e) {
+      assertThat(e.getMessage(), containsString("mask"));
+    }
+
+    // Remove the extended ACL
+    removeAcl(NESTED_URI, newAcl);
+    // Now we can add and remove a mask
+    addAcl(NESTED_URI, maskEntry);
+    removeAcl(NESTED_URI, maskEntry);
+  }
+
+  private void addAcl(AlluxioURI uri, AclEntry acl) throws Exception {
+    mFileSystemMaster.setAcl(uri, SetAclAction.MODIFY, Arrays.asList(acl),
+        SetAclOptions.defaults());
+  }
+
+  private void removeAcl(AlluxioURI uri, AclEntry acl) throws Exception {
+    mFileSystemMaster.setAcl(uri, SetAclAction.REMOVE, Arrays.asList(acl),
+        SetAclOptions.defaults());
+  }
+
+  private FileInfo getInfo(AlluxioURI uri) throws Exception {
+    return mFileSystemMaster.getFileInfo(uri, GetStatusOptions.defaults());
   }
 
   /**
@@ -1658,6 +1737,8 @@ public final class FileSystemMasterTest {
    */
   @Test
   public void setLargerTtlForFileWithTtl() throws Exception {
+    mFileSystemMaster.createDirectory(NESTED_URI,
+        CreateDirectoryOptions.defaults().setRecursive(true));
     CreateFileOptions options =
         CreateFileOptions.defaults().setBlockSizeBytes(Constants.KB).setRecursive(true).setTtl(0);
     long fileId = mFileSystemMaster.createFile(NESTED_FILE_URI, options);
@@ -1676,9 +1757,10 @@ public final class FileSystemMasterTest {
    */
   @Test
   public void setLargerTtlForDirectoryWithTtl() throws Exception {
-    CreateDirectoryOptions createDirectoryOptions =
-        CreateDirectoryOptions.defaults().setRecursive(true).setTtl(0);
-    mFileSystemMaster.createDirectory(NESTED_URI, createDirectoryOptions);
+    mFileSystemMaster.createDirectory(new AlluxioURI("/nested"),
+        CreateDirectoryOptions.defaults().setRecursive(true));
+    mFileSystemMaster.createDirectory(NESTED_URI,
+        CreateDirectoryOptions.defaults().setRecursive(true).setTtl(0));
     mFileSystemMaster.setAttribute(NESTED_URI,
         SetAttributeOptions.defaults().setTtl(Constants.HOUR_MS));
     HeartbeatScheduler.execute(HeartbeatContext.MASTER_TTL_CHECK);
@@ -1692,6 +1774,8 @@ public final class FileSystemMasterTest {
    */
   @Test
   public void setNoTtlForFileWithTtl() throws Exception {
+    mFileSystemMaster.createDirectory(NESTED_URI,
+        CreateDirectoryOptions.defaults().setRecursive(true));
     CreateFileOptions options =
         CreateFileOptions.defaults().setBlockSizeBytes(Constants.KB).setRecursive(true).setTtl(0);
     long fileId = mFileSystemMaster.createFile(NESTED_FILE_URI, options);
@@ -1709,6 +1793,8 @@ public final class FileSystemMasterTest {
    */
   @Test
   public void setNoTtlForDirectoryWithTtl() throws Exception {
+    mFileSystemMaster.createDirectory(new AlluxioURI("/nested"),
+        CreateDirectoryOptions.defaults().setRecursive(true));
     CreateDirectoryOptions createDirectoryOptions =
         CreateDirectoryOptions.defaults().setRecursive(true).setTtl(0);
     mFileSystemMaster.createDirectory(NESTED_URI, createDirectoryOptions);
@@ -2147,12 +2233,16 @@ public final class FileSystemMasterTest {
   @Test
   public void mountShadowDir() throws Exception {
     AlluxioURI alluxioURI = new AlluxioURI("/hello");
-    AlluxioURI ufsURI = createTempUfsDir("ufs/hello");
-    mFileSystemMaster.mount(alluxioURI, ufsURI, MountOptions.defaults());
+    AlluxioURI ufsURI = createTempUfsDir("ufs/hello/shadow");
+
+    mFileSystemMaster.mount(alluxioURI, ufsURI.getParent(), MountOptions.defaults());
     AlluxioURI shadowAlluxioURI = new AlluxioURI("/hello/shadow");
-    AlluxioURI anotherUfsURI = createTempUfsDir("ufs/hi");
-    mThrown.expect(InvalidPathException.class);
-    mFileSystemMaster.mount(shadowAlluxioURI, anotherUfsURI, MountOptions.defaults());
+    AlluxioURI notShadowAlluxioURI = new AlluxioURI("/hello/notshadow");
+    AlluxioURI shadowUfsURI = createTempUfsDir("ufs/hi");
+    AlluxioURI notShadowUfsURI = createTempUfsDir("ufs/notshadowhi");
+    mFileSystemMaster.mount(notShadowAlluxioURI, notShadowUfsURI, MountOptions.defaults());
+    mThrown.expect(IOException.class);
+    mFileSystemMaster.mount(shadowAlluxioURI, shadowUfsURI, MountOptions.defaults());
   }
 
   /**
@@ -2279,12 +2369,7 @@ public final class FileSystemMasterTest {
     FileSystemCommand command = mFileSystemMaster
         .workerHeartbeat(mWorkerId1, Lists.newArrayList(fileId), WorkerHeartbeatOptions.defaults());
     assertEquals(CommandType.Persist, command.getCommandType());
-    assertEquals(1,
-        command.getCommandOptions().getPersistOptions().getPersistFiles().size());
-    assertEquals(fileId,
-        command.getCommandOptions().getPersistOptions().getPersistFiles().get(0).getFileId());
-    assertEquals(blockId, (long) command.getCommandOptions().getPersistOptions()
-        .getPersistFiles().get(0).getBlockIds().get(0));
+    assertEquals(0, command.getCommandOptions().getPersistOptions().getPersistFiles().size());
   }
 
   /**
@@ -2294,9 +2379,10 @@ public final class FileSystemMasterTest {
   public void lostFilesDetection() throws Exception {
     createFileWithSingleBlock(NESTED_FILE_URI);
     long fileId = mFileSystemMaster.getFileId(NESTED_FILE_URI);
-    mFileSystemMaster.reportLostFile(fileId);
 
     FileInfo fileInfo = mFileSystemMaster.getFileInfo(fileId);
+    mBlockMaster.reportLostBlocks(fileInfo.getBlockIds());
+
     assertEquals(PersistenceState.NOT_PERSISTED.name(), fileInfo.getPersistenceState());
     // Check with getPersistenceState.
     assertEquals(PersistenceState.NOT_PERSISTED,
@@ -2382,8 +2468,7 @@ public final class FileSystemMasterTest {
     mFileSystemMaster.loadMetadata(uri,
         LoadMetadataOptions.defaults().setCreateAncestors(true));
     FileInfo info = mFileSystemMaster.getFileInfo(uri, GetStatusOptions.defaults());
-    Assert.assertTrue(info.convertAclToStringEntries().contains("user::rw-"));
-
+    Assert.assertTrue(info.convertAclToStringEntries().contains("user::r-x"));
   }
 
   /**
@@ -2428,6 +2513,17 @@ public final class FileSystemMasterTest {
     assertEquals(fingerprint,
         mFileSystemMaster.getFileInfo(NESTED_FILE_URI, GetStatusOptions.defaults())
             .getUfsFingerprint());
+  }
+
+  @Test
+  public void ignoreInvalidFiles() throws Exception {
+    FileUtils.createDir(Paths.get(mUnderFS, "test").toString());
+    FileUtils.createFile(Paths.get(mUnderFS, "test", "a?b=C").toString());
+    FileUtils.createFile(Paths.get(mUnderFS, "test", "valid").toString());
+    List<FileInfo> listing = mFileSystemMaster.listStatus(new AlluxioURI("/test"), ListStatusOptions
+        .defaults().setLoadMetadataType(LoadMetadataType.Always).setRecursive(true));
+    assertEquals(1, listing.size());
+    assertEquals("valid", listing.get(0).getName());
   }
 
   @Test

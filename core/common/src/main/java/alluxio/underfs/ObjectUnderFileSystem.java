@@ -82,7 +82,7 @@ public abstract class ObjectUnderFileSystem extends BaseUnderFileSystem {
     super(uri, ufsConf);
 
     int numThreads = Configuration.getInt(PropertyKey.UNDERFS_OBJECT_STORE_SERVICE_THREADS);
-    mExecutorService = ExecutorServiceFactories.fixedThreadPoolExecutorServiceFactory(
+    mExecutorService = ExecutorServiceFactories.fixedThreadPool(
         "alluxio-underfs-object-service-worker", numThreads).create();
   }
 
@@ -218,6 +218,10 @@ public abstract class ObjectUnderFileSystem extends BaseUnderFileSystem {
     public short getMode() {
       return mMode;
     }
+  }
+
+  @Override
+  public void cleanup() throws IOException {
   }
 
   @Override
@@ -959,7 +963,7 @@ public abstract class ObjectUnderFileSystem extends BaseUnderFileSystem {
    * @param path the path to strip
    * @return the path without the bucket prefix
    */
-  private String stripPrefixIfPresent(String path) {
+  protected String stripPrefixIfPresent(String path) {
     String stripedKey = CommonUtils.stripPrefixIfPresent(path,
         PathUtils.normalizePath(getRootKey(), PATH_SEPARATOR));
     if (!stripedKey.equals(path)) {
